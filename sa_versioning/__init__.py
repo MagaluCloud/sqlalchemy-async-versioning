@@ -92,7 +92,8 @@ def setup_versioning(base: type) -> None:
     for cls in _versioned_registry:
         _build_version_class(cls, base)
 
-    event.listen(Session, "before_flush", _handle_flush)
+    event.listen(Session, "before_flush", _handle_before_flush)
+    event.listen(Session, "after_flush", _handle_after_flush)
     _initialized = True
 
 
@@ -108,6 +109,7 @@ def _build_version_class(cls: type, base: type) -> type:
     - ``id``          – UUID primary key (auto-generated)
     - ``resource_id`` – FK to the original table's PK (indexed, CASCADE delete)
     - ``changed_at``  – timestamp of the change (indexed)
+    - ``operation_type`` – INSERT, UPDATE, DELETE (indexed)
     - one nullable column for every non-PK, non-excluded column in *cls*
     """
     mapper = sa.inspect(cls)
@@ -122,7 +124,7 @@ def _build_version_class(cls: type, base: type) -> type:
     exclude = set(getattr(cls, "__version_exclude__", ["created_at", "updated_at"]))
 
     attrs: dict[str, Any] = {
-        "__tablename__": f"{cls.__tablename__}_version",
+        "__tablename__": f"{cls.__tablename__[:54]}_version",
         "id": Column(sa.Uuid, primary_key=True, default=_uuid.uuid4),
         "resource_id": Column(
             pk_col.type.copy(),
@@ -134,6 +136,9 @@ def _build_version_class(cls: type, base: type) -> type:
         ),
         "changed_at": Column(
             DateTime(timezone=True), nullable=False, default=_now, index=True
+        ),
+        "operation_type": Column(
+            sa.String(10), nullable=False, index=True
         ),
     }
 
@@ -153,42 +158,53 @@ def _build_version_class(cls: type, base: type) -> type:
 # ---------------------------------------------------------------------------
 
 
-def _handle_flush(
+def _handle_before_flush(
     session: Session, flush_context: Any, instances: Any
 ) -> None:
-    """``before_flush`` handler — inserts version records for all changes.
-
-    Fires on the underlying sync ``Session`` that ``AsyncSession`` wraps, so
-    this works transparently with asyncpg.  Only ``session.add()`` is called
-    here — no async I/O.
-    """
+    """``before_flush`` handler — tracks updates and deletes, and buffers inserts."""
     now = _now()
 
-    for obj in list(session.new):
-        if isinstance(obj, Versioned):
-            _take_snapshot(session, obj, now, is_new=True)
+    # Buffer new instances for after_flush to capture DB-generated PKs and defaults
+    new_objs = [obj for obj in session.new if isinstance(obj, Versioned)]
+    if new_objs:
+        session.info.setdefault("sa_versioning_new", []).extend(new_objs)
 
     for obj in list(session.dirty):
         if isinstance(obj, Versioned):
-            _take_snapshot(session, obj, now, is_new=False)
+            _take_snapshot(session, obj, now, "UPDATE")
+
+    for obj in list(session.deleted):
+        if isinstance(obj, Versioned):
+            _take_snapshot(session, obj, now, "DELETE")
+
+
+def _handle_after_flush(
+    session: Session, flush_context: Any
+) -> None:
+    """``after_flush`` handler — inserts version records for buffered inserts."""
+    new_objs = session.info.pop("sa_versioning_new", [])
+    if not new_objs:
+        return
+
+    now = _now()
+    for obj in new_objs:
+        _take_snapshot(session, obj, now, "INSERT")
 
 
 def _take_snapshot(
-    session: Session, obj: Any, now: datetime, is_new: bool
+    session: Session, obj: Any, now: datetime, operation_type: str
 ) -> None:
     cls = type(obj)
     mapper = sa.inspect(cls)
     pk_col = next(iter(mapper.primary_key))
     track: list[str] | None = getattr(cls, "__version_track__", None)
+    state = attributes.instance_state(obj)
 
-    if is_new:
-        # Column-level defaults (e.g. uuid4, VMStatus.creating) are applied by
-        # SQLAlchemy only when building the INSERT statement, so the attributes
-        # may still be None here.  Pre-apply Python-side defaults so the FK and
-        # any snapshot columns have sensible values.
-        _ensure_pk(obj, pk_col)
+    if operation_type == "INSERT":
         should_snapshot = True
-    else:
+    elif operation_type == "DELETE":
+        should_snapshot = True
+    else:  # UPDATE
         if track:
             should_snapshot = any(
                 attributes.get_history(obj, col_name).added
@@ -197,7 +213,7 @@ def _take_snapshot(
         else:
             should_snapshot = any(
                 attributes.get_history(obj, col.key).added
-                for col in mapper.mapper.column_attrs
+                for col in mapper.column_attrs
             )
 
     if not should_snapshot:
@@ -207,47 +223,22 @@ def _take_snapshot(
     version_cls = cls.version_class
     version_mapper = sa.inspect(version_cls)
 
-    data: dict[str, Any] = {"resource_id": resource_id, "changed_at": now}
+    data: dict[str, Any] = {
+        "resource_id": resource_id,
+        "changed_at": now,
+        "operation_type": operation_type,
+    }
 
     for col in version_mapper.columns:
-        if col.name in ("id", "resource_id", "changed_at"):
+        if col.name in ("id", "resource_id", "changed_at", "operation_type"):
             continue
-        val = getattr(obj, col.name, None)
-        # For new objects fall back to the column's Python-side default so the
-        # snapshot is consistent even before the INSERT fires.
-        if val is None and is_new:
-            original_col = mapper.columns.get(col.name)
-            if original_col is not None:
-                val = _python_default(original_col)
+        
+        # Prevent MissingGreenlet for lazy loaded / deferred columns
+        if col.name in state.unloaded:
+            val = None
+        else:
+            val = getattr(obj, col.name, None)
+            
         data[col.name] = val
 
     session.add(version_cls(**data))
-
-
-def _ensure_pk(obj: Any, pk_col: Any) -> None:
-    """Pre-generate the PK if it hasn't been set yet."""
-    if getattr(obj, pk_col.name) is None:
-        val = _python_default(pk_col)
-        if val is not None:
-            setattr(obj, pk_col.name, val)
-
-
-def _python_default(col: Any) -> Any:
-    """Return the Python-side default value for *col*, or ``None``.
-
-    Handles both scalar defaults and zero-argument callables (``uuid.uuid4``,
-    enum members, etc.).  Ignores server-side defaults.
-    """
-    if col.default is None:
-        return None
-    arg = col.default.arg
-    if callable(arg):
-        try:
-            return arg()
-        except TypeError:
-            try:
-                return arg(None)  # some SA callables accept an ExecutionContext
-            except Exception:
-                return None
-    # Scalar default (e.g. VMStatus.creating)
-    return arg
